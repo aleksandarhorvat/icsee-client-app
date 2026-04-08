@@ -1,5 +1,120 @@
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/dbuezas)
 
+# ICSee Camera Manager — Desktop Application
+
+A cross-platform desktop application for monitoring and managing ICSee/XMEye/DVR-IP/NetSurveillance cameras.
+Built with **Python 3.10+** and **PySide6 (Qt for Python)**.
+
+---
+
+## Features
+
+- **Camera management** — add, edit and remove cameras; settings are persisted in a local JSON file
+- **Live stream viewer** — real-time H.264/H.265 video via the DVRIP protocol
+- **Camera controls** — start / stop stream, reconnect, JPEG snapshot
+- **PTZ support** — on-screen directional pad with press-and-hold (auto-stop on release)
+- **Status indicators** — per-camera connection state in the sidebar
+- **Automatic reconnect** — stream errors are reported in the status bar; use Refresh to reconnect
+
+---
+
+## Project structure
+
+```
+icsee-client-app/
+├── app/
+│   ├── main.py                   # Entry point
+│   ├── models/
+│   │   └── camera.py             # CameraConfig dataclass
+│   ├── utils/
+│   │   └── config_manager.py     # JSON config persistence
+│   ├── services/
+│   │   └── camera_service.py     # Async DVRIPCam wrapper + Qt signals
+│   └── ui/
+│       └── main_window.py        # PySide6 MainWindow
+├── custom_components/icsee_ptz/  # Existing ICSee API (unchanged)
+│   └── asyncio_dvrip.py          # DVRIPCam class
+├── requirements.txt
+├── icsee.spec                    # PyInstaller build spec
+└── README.md
+```
+
+---
+
+## Setup
+
+### Prerequisites
+
+- Python 3.10 or later
+- `pip`
+
+### Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+> **Note — video decoding:**  
+> Live H.264/H.265 streaming requires [PyAV](https://pyav.org/) (`av`) and `numpy`.
+> Both are listed in `requirements.txt`.  
+> If PyAV is unavailable the application still runs; JPEG snapshots will work,
+> but the live stream panel will stay blank.
+
+### Run the application
+
+```bash
+python app/main.py
+```
+
+---
+
+## Build a standalone executable
+
+### Using the provided spec file (recommended)
+
+```bash
+pyinstaller icsee.spec
+```
+
+### One-liner alternative
+
+```bash
+pyinstaller --onefile --windowed app/main.py \
+    --name ICSeeClient \
+    --add-data "custom_components:custom_components"
+```
+
+The executable will be placed in `dist/ICSeeClient` (or `dist/ICSeeClient.exe` on Windows).
+
+---
+
+## Usage
+
+1. Launch the application.
+2. Click **+ Add** in the left sidebar and enter the camera's IP address, username, and password.
+3. Select the camera in the sidebar, then press **▶ Connect** in the toolbar.
+4. The live stream starts automatically once connected.
+5. Use the PTZ pad at the bottom to pan/tilt/zoom (hold button → moves, release → stops).
+6. Press **📷 Snapshot** to capture the current frame as a JPEG.
+7. Press **↺ Refresh** to force a reconnect at any time.
+
+### Camera configuration file
+
+Camera settings are stored at:
+- **Windows**: `%APPDATA%\ICSeeClient\cameras.json`
+- **macOS / Linux**: `~/.ICSeeClient/cameras.json` (falls back to `~/ICSeeClient/cameras.json`)
+
+---
+
+## Architecture notes
+
+- The `DVRIPCam` API is **async** (asyncio). A dedicated daemon thread runs a background asyncio event loop for all network I/O.
+- Qt signals (`connection_changed`, `frame_ready`, `error_occurred`) are used to safely marshal results back to the UI thread.
+- Each camera maintains **two** TCP connections — one for commands (PTZ, snapshot) and one dedicated to the blocking `start_monitor()` stream reader — preventing socket conflicts.
+- Video frames (H.264/H.265 NAL units) are decoded by [PyAV](https://pyav.org/) and converted to `QImage` for display.
+
+---
+
 # ICSee PTZ control integration for Home Assistant
 
 Home Assistant integration to send ptz commands to ICSee/XMEye/DVR-IP/NetSurveillance/Sofia cameras.
