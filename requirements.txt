@@ -1,0 +1,11 @@
+# ── Core GUI ──────────────────────────────────────────────────────────────────
+PySide6>=6.5.0
+
+# ── Video decoding ─────────────────────────────────────────────────────────────
+# PyAV provides H.264/H.265 decoding for the live stream viewer.
+# numpy is required by av for frame-to-array conversion.
+av>=11.0.0
+numpy>=1.24.0
+
+# ── Packaging ─────────────────────────────────────────────────────────────────
+pyinstaller>=6.0.0
