@@ -187,13 +187,9 @@ class CameraService(QObject):
     # ------------------------------------------------------------------
 
     def connect_camera(self, config: CameraConfig) -> None:
-        """Open a connection to the camera (IP or CloudID) and update connected state."""
+        """Open a command connection to the camera and update connected state."""
         self._states.setdefault(config.id, _CameraState(config))
-        # UPDATED: route to the correct connection path.
-        if config.connection_type == "cloud":
-            self._submit(self._connect_cloud(config.id))
-        else:
-            self._submit(self._connect(config.id))
+        self._submit(self._connect(config.id))
 
     def disconnect_camera(self, camera_id: str) -> None:
         """Stop streaming and close all connections for the given camera."""
@@ -245,68 +241,10 @@ class CameraService(QObject):
         await cam.login(loop)
         return cam
 
-    # NEW: Cloud/P2P connection implementation ---------------------------------
-
-    async def _connect_cloud(self, camera_id: str) -> None:
-        """
-        Async body for CloudID connections.
-
-        Validates the CloudID and delegates to the P2P layer.
-        Currently raises a descriptive error because the bundled DVRIPCam
-        library does not include a P2P relay client.  Replace the body of the
-        ``try`` block with the real P2P SDK call once that dependency is added.
-        """
-        state = self._states.get(camera_id)
-        if state is None:
-            return
-
-        cloud_id = (state.config.cloud_id or "").strip()
-        if not cloud_id:
-            logger.warning("CloudID is empty for camera %s.", state.config.name)
-            state.connected = False
-            self.connection_changed.emit(camera_id, False)
-            self.error_occurred.emit(camera_id, "CloudID is empty — please edit the camera and enter a valid CloudID.")
-            return
-
-        logger.info(
-            "Connecting to camera %s via CloudID '%s' …",
-            state.config.name,
-            cloud_id,
-        )
-        try:
-            # TODO: replace this block with a real P2P / relay SDK call once
-            # the dependency is available.  The call should resolve the
-            # CloudID to a reachable host:port and return a DVRIPCam-compatible
-            # connection object, then assign it to state.command_conn and set
-            # state.connected = True.
-            raise NotImplementedError(
-                "P2P/CloudID connections require a relay SDK that is not yet "
-                "bundled with this application.  Please use an IP-based "
-                "connection, or add the EasyLink/XMEye P2P library and "
-                "implement _connect_cloud()."
-            )
-        except NotImplementedError as exc:
-            logger.warning("CloudID connect not implemented for camera %s: %s", state.config.name, exc)
-            state.connected = False
-            self.connection_changed.emit(camera_id, False)
-            self.error_occurred.emit(camera_id, str(exc))
-        except SomethingIsWrongWithCamera as exc:
-            logger.warning("CloudID connect failed for camera %s: %s", state.config.name, exc)
-            state.connected = False
-            self.connection_changed.emit(camera_id, False)
-            self.error_occurred.emit(camera_id, f"CloudID connect failed: {exc}")
-        except Exception as exc:
-            logger.exception("Unexpected error during CloudID connect for camera %s", state.config.name)
-            state.connected = False
-            self.connection_changed.emit(camera_id, False)
-            self.error_occurred.emit(camera_id, f"CloudID error: {exc}")
-
     async def _connect(self, camera_id: str) -> None:
-        """Connect via IP (only called for connection_type == "ip")."""
         state = self._states.get(camera_id)
         if state is None:
             return
-
         try:
             logger.info("Connecting to camera %s (%s) …", state.config.name, state.config.host)
             conn = await self._make_dvrip(state.config)

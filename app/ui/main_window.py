@@ -37,10 +37,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
-    QStackedWidget,  # NEW
     QStatusBar,
-    QTabBar,  # NEW
-    QTabWidget,  # NEW
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -101,30 +98,21 @@ class _VideoWidget(QLabel):
 
 
 class _AddCameraDialog(QDialog):
-    """Modal dialog for entering camera credentials (IP or CloudID)."""
+    """Simple modal dialog for entering camera credentials."""
 
     def __init__(self, parent: Optional[QWidget] = None, camera: Optional[CameraConfig] = None) -> None:
         super().__init__(parent)
         editing = camera is not None
         self.setWindowTitle("Edit Camera" if editing else "Add Camera")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(360)
 
-        outer = QVBoxLayout(self)
-
-        # ── Connection-type tab widget ─────────────────────────────────
-        # NEW: tab bar lets the user pick IP Address or CloudID mode.
-        self._tabs = QTabWidget()
-        outer.addWidget(self._tabs)
-
-        # ── IP Address tab ─────────────────────────────────────────────
-        ip_widget = QWidget()
-        ip_form = QFormLayout(ip_widget)
+        layout = QFormLayout(self)
 
         self._name = QLineEdit(camera.name if editing else "")
         self._host = QLineEdit(camera.host if editing else "")
-        self._user_ip = QLineEdit(camera.username if editing else "admin")
-        self._pass_ip = QLineEdit(camera.password if editing else "")
-        self._pass_ip.setEchoMode(QLineEdit.EchoMode.Password)
+        self._user = QLineEdit(camera.username if editing else "admin")
+        self._pass = QLineEdit(camera.password if editing else "")
+        self._pass.setEchoMode(QLineEdit.EchoMode.Password)
         self._port = QSpinBox()
         self._port.setRange(1, 65535)
         self._port.setValue(camera.port if editing else 34567)
@@ -132,96 +120,33 @@ class _AddCameraDialog(QDialog):
         self._channel.setRange(0, 32)
         self._channel.setValue(camera.channel if editing else 0)
 
-        ip_form.addRow("Name:", self._name)
-        ip_form.addRow("Host / IP:", self._host)
-        ip_form.addRow("Username:", self._user_ip)
-        ip_form.addRow("Password:", self._pass_ip)
-        ip_form.addRow("Port:", self._port)
-        ip_form.addRow("Channel:", self._channel)
+        layout.addRow("Name:", self._name)
+        layout.addRow("Host / IP:", self._host)
+        layout.addRow("Username:", self._user)
+        layout.addRow("Password:", self._pass)
+        layout.addRow("Port:", self._port)
+        layout.addRow("Channel:", self._channel)
 
-        self._tabs.addTab(ip_widget, "IP Address")
-
-        # ── CloudID tab ────────────────────────────────────────────────
-        # NEW: fields specific to CloudID / P2P connection.
-        cloud_widget = QWidget()
-        cloud_form = QFormLayout(cloud_widget)
-
-        # Name field is shared visually; we use a separate widget so each
-        # tab is self-contained.  The active tab's name field wins.
-        self._name_cloud = QLineEdit(camera.name if editing else "")
-        self._cloud_id = QLineEdit(camera.cloud_id if editing else "")
-        self._cloud_id.setPlaceholderText("e.g. ABCD1234EFGH or SN:XXXXXXXXXXX")
-        self._user_cloud = QLineEdit(camera.username if editing else "admin")
-        self._pass_cloud = QLineEdit(camera.password if editing else "")
-        self._pass_cloud.setEchoMode(QLineEdit.EchoMode.Password)
-
-        cloud_form.addRow("Name:", self._name_cloud)
-        cloud_form.addRow("CloudID:", self._cloud_id)
-        cloud_form.addRow("Username:", self._user_cloud)
-        cloud_form.addRow("Password:", self._pass_cloud)
-
-        # Informational hint about P2P support status.
-        hint = QLabel(
-            "<i>Note: P2P/CloudID connections require an additional relay "
-            "SDK. The camera will be saved; connection will report an error "
-            "until the SDK is integrated.</i>"
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #888; font-size: 11px;")
-        cloud_form.addRow(hint)
-
-        self._tabs.addTab(cloud_widget, "CloudID")
-
-        # Select the correct tab when editing an existing camera.  # UPDATED
-        if editing and camera.connection_type == "cloud":
-            self._tabs.setCurrentIndex(1)
-
-        # Keep the Name fields in sync so switching tabs doesn't lose the name.
-        self._name.textChanged.connect(self._name_cloud.setText)
-        self._name_cloud.textChanged.connect(self._name.setText)
-
-        # ── Buttons ────────────────────────────────────────────────────
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        outer.addWidget(buttons)
+        layout.addRow(buttons)
 
     def get_config(self) -> Optional[CameraConfig]:
-        # UPDATED: build the CameraConfig from whichever tab is active.
-        if self._tabs.currentIndex() == 0:
-            # IP Address tab
-            name = self._name.text().strip()
-            host = self._host.text().strip()
-            if not name or not host:
-                return None
-            return CameraConfig(
-                name=name,
-                host=host,
-                username=self._user_ip.text().strip() or "admin",
-                password=self._pass_ip.text(),
-                port=self._port.value(),
-                channel=self._channel.value(),
-                connection_type="ip",
-                cloud_id="",
-            )
-        else:
-            # CloudID tab
-            name = self._name_cloud.text().strip()
-            cloud_id = self._cloud_id.text().strip()
-            if not name or not cloud_id:
-                return None
-            return CameraConfig(
-                name=name,
-                host="",  # not used for cloud connections
-                username=self._user_cloud.text().strip() or "admin",
-                password=self._pass_cloud.text(),
-                port=34567,
-                channel=0,
-                connection_type="cloud",
-                cloud_id=cloud_id,
-            )
+        name = self._name.text().strip()
+        host = self._host.text().strip()
+        if not name or not host:
+            return None
+        return CameraConfig(
+            name=name,
+            host=host,
+            username=self._user.text().strip() or "admin",
+            password=self._pass.text(),
+            port=self._port.value(),
+            channel=self._channel.value(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -453,11 +378,9 @@ class MainWindow(QMainWindow):
 
     def _add_camera_to_ui(self, cam: CameraConfig) -> None:
         self._cameras[cam.id] = cam
-        # UPDATED: include connection-type indicator in the list label.
-        label = self._camera_label(cam)
-        item = QListWidgetItem(label)
+        item = QListWidgetItem(cam.name)
         item.setData(Qt.ItemDataRole.UserRole, cam.id)
-        item.setToolTip(self._camera_tooltip(cam))
+        item.setToolTip(f"{cam.host}:{cam.port}")
         self._list_items[cam.id] = item
         self._camera_list.addItem(item)
 
@@ -474,13 +397,7 @@ class MainWindow(QMainWindow):
             return
         cfg = dlg.get_config()
         if cfg is None:
-            # UPDATED: tailor the message to the active connection type.
-            QMessageBox.warning(
-                self,
-                "Invalid Input",
-                "Name and Host are required for IP cameras.\n"
-                "Name and CloudID are required for CloudID cameras.",
-            )
+            QMessageBox.warning(self, "Invalid Input", "Name and Host are required.")
             return
         self._add_camera_to_ui(cfg)
         self._save_cameras()
@@ -521,9 +438,8 @@ class MainWindow(QMainWindow):
         # Preserve the original ID.
         new_cfg.id = camera_id
         self._cameras[camera_id] = new_cfg
-        # UPDATED: refresh label and tooltip to reflect any connection-type change.
-        item.setText(self._camera_label(new_cfg))
-        item.setToolTip(self._camera_tooltip(new_cfg))
+        item.setText(new_cfg.name)
+        item.setToolTip(f"{new_cfg.host}:{new_cfg.port}")
         self._save_cameras()
 
     def _on_camera_selected(self, current: Optional[QListWidgetItem], _prev) -> None:
@@ -534,11 +450,7 @@ class MainWindow(QMainWindow):
         self._active_camera_id = current.data(Qt.ItemDataRole.UserRole)
         cam = self._cameras.get(self._active_camera_id)
         if cam:
-            # UPDATED: show connection address appropriate to the type.
-            if cam.connection_type == "cloud":
-                self._set_status(f"Selected: {cam.name}  [CloudID: {cam.cloud_id}]", "#aaa")
-            else:
-                self._set_status(f"Selected: {cam.name} ({cam.host})", "#aaa")
+            self._set_status(f"Selected: {cam.name} ({cam.host})", "#aaa")
 
     def _on_connect(self) -> None:
         if self._active_camera_id is None:
@@ -624,22 +536,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    # NEW: connection-type aware label/tooltip helpers --------------------
-
-    @staticmethod
-    def _camera_label(cam: CameraConfig) -> str:
-        """Return the list-item label including a small connection-type badge."""
-        if cam.connection_type == "cloud":
-            return f"[Cloud]  {cam.name}"
-        return f"[IP]  {cam.name}"
-
-    @staticmethod
-    def _camera_tooltip(cam: CameraConfig) -> str:
-        """Return the tooltip text appropriate for the camera's connection type."""
-        if cam.connection_type == "cloud":
-            return f"CloudID: {cam.cloud_id}"
-        return f"{cam.host}:{cam.port}"
 
     def _update_toolbar_state(self, *, connected: bool) -> None:
         self._act_connect.setEnabled(not connected)
