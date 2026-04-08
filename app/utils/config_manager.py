@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import List
 
@@ -9,8 +10,20 @@ from app.models.camera import CameraConfig
 
 logger = logging.getLogger(__name__)
 
-# Store config in the OS-appropriate user data directory.
-_CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ICSeeClient"
+
+def _default_config_dir() -> Path:
+    """Return an OS-appropriate directory for storing application data."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", Path.home())
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        # XDG_CONFIG_HOME or ~/.config on Linux/BSD
+        base = os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+    return Path(base) / "ICSeeClient"
+
+
+_CONFIG_DIR = _default_config_dir()
 _CONFIG_FILE = _CONFIG_DIR / "cameras.json"
 
 

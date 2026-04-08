@@ -36,7 +36,10 @@ import os
 # Resolve the path to asyncio_dvrip.py whether we are running from source or
 # packaged as a PyInstaller bundle (where data files land in sys._MEIPASS).
 if getattr(sys, "frozen", False):
-    _BUNDLE_DIR = sys._MEIPASS  # type: ignore[attr-defined]
+    _bundle_dir = getattr(sys, "_MEIPASS", "")
+    if not (os.path.isdir(_bundle_dir)):
+        raise RuntimeError(f"PyInstaller bundle directory not found: {_bundle_dir!r}")
+    _BUNDLE_DIR = _bundle_dir
 else:
     _BUNDLE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -333,7 +336,6 @@ class CameraService(QObject):
             # Audio frames and unknown types are silently discarded.
 
         try:
-            channel = self._states[camera_id].config.channel
             await conn.start_monitor(
                 _frame_callback,
                 user={"camera_id": camera_id},
@@ -357,8 +359,8 @@ class CameraService(QObject):
         if state.stream_task and not state.stream_task.done():
             state.stream_task.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(state.stream_task), timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+                await state.stream_task
+            except (asyncio.CancelledError, Exception):
                 pass
         state.stream_task = None
         if state.stream_conn:
