@@ -187,9 +187,13 @@ class CameraService(QObject):
     # ------------------------------------------------------------------
 
     def connect_camera(self, config: CameraConfig) -> None:
-        """Open a command connection to the camera and update connected state."""
+        """Open a connection to the camera (IP or CloudID) and update connected state."""
         self._states.setdefault(config.id, _CameraState(config))
-        self._submit(self._connect(config.id))
+        # UPDATED: route to the correct connection path.
+        if config.connection_type == "cloud":
+            self._submit(self._connect_cloud(config.id))
+        else:
+            self._submit(self._connect(config.id))
 
     def disconnect_camera(self, camera_id: str) -> None:
         """Stop streaming and close all connections for the given camera."""
@@ -241,10 +245,87 @@ class CameraService(QObject):
         await cam.login(loop)
         return cam
 
+    # NEW: Cloud/P2P connection entry-point ---------------------------------
+
+    def connect_via_cloud_id(self, config: CameraConfig) -> None:
+        """
+        Open a connection to the camera using its CloudID (P2P serial number).
+
+        The underlying DVRIPCam library communicates over raw TCP/UDP to a
+        direct IP address; it does not include a P2P relay client.  When the
+        application is extended with a P2P SDK (e.g. EasyLink / XMEye SDK)
+        this method is the single place to wire it in.  Until then it reports
+        a clear, user-visible error rather than silently failing.
+        """
+        self._states.setdefault(config.id, _CameraState(config))
+        self._submit(self._connect_cloud(config.id))
+
+    async def _connect_cloud(self, camera_id: str) -> None:
+        """
+        Async body for CloudID connections.
+
+        Validates the CloudID format and delegates to the P2P layer.
+        Currently raises a descriptive error because the bundled DVRIPCam
+        library does not include a P2P relay client.  Replace the body of the
+        `try` block with the real P2P SDK call once that dependency is added.
+        """
+        state = self._states.get(camera_id)
+        if state is None:
+            return
+
+        cloud_id = (state.config.cloud_id or "").strip()
+        if not cloud_id:
+            logger.warning("CloudID is empty for camera %s.", state.config.name)
+            state.connected = False
+            self.connection_changed.emit(camera_id, False)
+            self.error_occurred.emit(camera_id, "CloudID is empty — please edit the camera and enter a valid CloudID.")
+            return
+
+        logger.info(
+            "Connecting to camera %s via CloudID '%s' …",
+            state.config.name,
+            cloud_id,
+        )
+        try:
+            # TODO: replace this block with a real P2P / relay SDK call once
+            # the dependency is available.  The call should resolve the
+            # CloudID to a reachable host:port and return a DVRIPCam-compatible
+            # connection object, then assign it to state.command_conn and set
+            # state.connected = True.
+            raise NotImplementedError(
+                "P2P/CloudID connections require a relay SDK that is not yet "
+                "bundled with this application.  Please use an IP-based "
+                "connection, or add the EasyLink/XMEye P2P library and "
+                "implement this method."
+            )
+        except NotImplementedError as exc:
+            logger.warning("CloudID connect not implemented for camera %s: %s", state.config.name, exc)
+            state.connected = False
+            self.connection_changed.emit(camera_id, False)
+            self.error_occurred.emit(camera_id, str(exc))
+        except SomethingIsWrongWithCamera as exc:
+            logger.warning("CloudID connect failed for camera %s: %s", state.config.name, exc)
+            state.connected = False
+            self.connection_changed.emit(camera_id, False)
+            self.error_occurred.emit(camera_id, f"CloudID connect failed: {exc}")
+        except Exception as exc:
+            logger.exception("Unexpected error during CloudID connect for camera %s", state.config.name)
+            state.connected = False
+            self.connection_changed.emit(camera_id, False)
+            self.error_occurred.emit(camera_id, f"CloudID error: {exc}")
+
+    # UPDATED: route to IP or Cloud path ------------------------------------
+
     async def _connect(self, camera_id: str) -> None:
         state = self._states.get(camera_id)
         if state is None:
             return
+
+        # UPDATED: dispatch based on connection_type.
+        if state.config.connection_type == "cloud":
+            await self._connect_cloud(camera_id)
+            return
+
         try:
             logger.info("Connecting to camera %s (%s) …", state.config.name, state.config.host)
             conn = await self._make_dvrip(state.config)
