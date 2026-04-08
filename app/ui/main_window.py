@@ -631,8 +631,8 @@ class MainWindow(QMainWindow):
     def _camera_label(cam: CameraConfig) -> str:
         """Return the list-item label including a small connection-type badge."""
         if cam.connection_type == "cloud":
-            return f"☁  {cam.name}"
-        return f"🌐  {cam.name}"
+            return f"[Cloud]  {cam.name}"
+        return f"[IP]  {cam.name}"
 
     @staticmethod
     def _camera_tooltip(cam: CameraConfig) -> str:

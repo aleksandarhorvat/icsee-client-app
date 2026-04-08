@@ -245,29 +245,16 @@ class CameraService(QObject):
         await cam.login(loop)
         return cam
 
-    # NEW: Cloud/P2P connection entry-point ---------------------------------
-
-    def connect_via_cloud_id(self, config: CameraConfig) -> None:
-        """
-        Open a connection to the camera using its CloudID (P2P serial number).
-
-        The underlying DVRIPCam library communicates over raw TCP/UDP to a
-        direct IP address; it does not include a P2P relay client.  When the
-        application is extended with a P2P SDK (e.g. EasyLink / XMEye SDK)
-        this method is the single place to wire it in.  Until then it reports
-        a clear, user-visible error rather than silently failing.
-        """
-        self._states.setdefault(config.id, _CameraState(config))
-        self._submit(self._connect_cloud(config.id))
+    # NEW: Cloud/P2P connection implementation ---------------------------------
 
     async def _connect_cloud(self, camera_id: str) -> None:
         """
         Async body for CloudID connections.
 
-        Validates the CloudID format and delegates to the P2P layer.
+        Validates the CloudID and delegates to the P2P layer.
         Currently raises a descriptive error because the bundled DVRIPCam
         library does not include a P2P relay client.  Replace the body of the
-        `try` block with the real P2P SDK call once that dependency is added.
+        ``try`` block with the real P2P SDK call once that dependency is added.
         """
         state = self._states.get(camera_id)
         if state is None:
@@ -296,7 +283,7 @@ class CameraService(QObject):
                 "P2P/CloudID connections require a relay SDK that is not yet "
                 "bundled with this application.  Please use an IP-based "
                 "connection, or add the EasyLink/XMEye P2P library and "
-                "implement this method."
+                "implement _connect_cloud()."
             )
         except NotImplementedError as exc:
             logger.warning("CloudID connect not implemented for camera %s: %s", state.config.name, exc)
@@ -314,16 +301,10 @@ class CameraService(QObject):
             self.connection_changed.emit(camera_id, False)
             self.error_occurred.emit(camera_id, f"CloudID error: {exc}")
 
-    # UPDATED: route to IP or Cloud path ------------------------------------
-
     async def _connect(self, camera_id: str) -> None:
+        """Connect via IP (only called for connection_type == "ip")."""
         state = self._states.get(camera_id)
         if state is None:
-            return
-
-        # UPDATED: dispatch based on connection_type.
-        if state.config.connection_type == "cloud":
-            await self._connect_cloud(camera_id)
             return
 
         try:
