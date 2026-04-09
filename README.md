@@ -1,305 +1,90 @@
-[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/dbuezas)
+# ICSee Camera Manager
 
-# ICSee Camera Manager — Desktop Application
+Desktop application for monitoring and controlling ICSee/XMEye/DVR-IP/NetSurveillance cameras.
+The app is built with Python and PySide6 and is tuned for quick camera preview updates and simple day-to-day camera control.
 
-A cross-platform desktop application for monitoring and managing ICSee/XMEye/DVR-IP/NetSurveillance cameras.
-Built with **Python 3.10+** and **PySide6 (Qt for Python)**.
+## What it does
 
----
+- Manage multiple cameras from a local list stored on disk
+- Open a live video stream with HEVC/H.264 decoding
+- Auto-connect to the first saved camera when the app opens
+- Send PTZ movement commands with press-and-hold controls
+- Capture snapshots from the current camera
+- Listen to camera audio when the camera supports monitor audio
+- Keep the interface focused with a large video area, sidebar camera list, and right-side PTZ pad
+- Preserve camera settings in a local JSON file
 
-## Features
+## Project layout
 
-- **Camera management** — add, edit and remove cameras; settings are persisted in a local JSON file
-- **Live stream viewer** — real-time H.264/H.265 video via the DVRIP protocol
-- **Camera controls** — start / stop stream, reconnect, JPEG snapshot
-- **PTZ support** — on-screen directional pad with press-and-hold (auto-stop on release)
-- **Status indicators** — per-camera connection state in the sidebar
-- **Automatic reconnect** — stream errors are reported in the status bar; use Refresh to reconnect
-
----
-
-## Project structure
-
-```
+```text
 icsee-client-app/
 ├── app/
-│   ├── main.py                   # Entry point
-│   ├── models/
-│   │   └── camera.py             # CameraConfig dataclass
-│   ├── utils/
-│   │   └── config_manager.py     # JSON config persistence
-│   ├── services/
-│   │   └── camera_service.py     # Async DVRIPCam wrapper + Qt signals
-│   └── ui/
-│       └── main_window.py        # PySide6 MainWindow
-├── custom_components/icsee_ptz/  # Existing ICSee API (unchanged)
-│   └── asyncio_dvrip.py          # DVRIPCam class
+│   ├── main.py               # Application entry point
+│   ├── models/camera.py      # CameraConfig dataclass
+│   ├── services/camera_service.py
+│   ├── ui/main_window.py     # Main PySide6 window
+│   └── utils/config_manager.py
+├── custom_components/icsee_ptz/
+│   └── asyncio_dvrip.py      # Bundled DVRIP protocol implementation used by the app
+├── icsee.spec                # PyInstaller build spec
 ├── requirements.txt
-├── icsee.spec                    # PyInstaller build spec
 └── README.md
 ```
 
----
+The repository also contains the upstream Home Assistant custom component files under `custom_components/icsee_ptz/`. They are kept as part of the forked source tree, but the documentation below focuses on the desktop app.
 
-## Setup
-
-### Prerequisites
+## Requirements
 
 - Python 3.10 or later
 - `pip`
 
-### Install dependencies
+Video decoding uses [PyAV](https://pyav.org/) (`av`) and `numpy`, both listed in `requirements.txt`.
+
+## Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> **Note — video decoding:**  
-> Live H.264/H.265 streaming requires [PyAV](https://pyav.org/) (`av`) and `numpy`.
-> Both are listed in `requirements.txt`.  
-> If PyAV is unavailable the application still runs; JPEG snapshots will work,
-> but the live stream panel will stay blank.
-
-### Run the application
+## Run
 
 ```bash
 python app/main.py
 ```
 
----
+## Build
 
-## Build a standalone executable
-
-### Using the provided spec file (recommended)
+Use the provided PyInstaller spec:
 
 ```bash
 pyinstaller icsee.spec
 ```
 
-### One-liner alternative
-
-```bash
-pyinstaller --onefile --windowed app/main.py \
-    --name ICSeeClient \
-    --add-data "custom_components:custom_components"
-```
-
-The executable will be placed in `dist/ICSeeClient` (or `dist/ICSeeClient.exe` on Windows).
-
----
+The standalone executable will be created in `dist/ICSeeClient` on desktop platforms, or `dist/ICSeeClient.exe` on Windows.
+The spec bundles only the DVRIP protocol module that the app actually imports, which keeps the Windows build smaller without changing behavior.
 
 ## Usage
 
-1. Launch the application.
-2. Click **+ Add** in the left sidebar and enter the camera's IP address, username, and password.
-3. Select the camera in the sidebar, then press **▶ Connect** in the toolbar.
-4. The live stream starts automatically once connected.
-5. Use the PTZ pad at the bottom to pan/tilt/zoom (hold button → moves, release → stops).
-6. Press **📷 Snapshot** to capture the current frame as a JPEG.
-7. Press **↺ Refresh** to force a reconnect at any time.
+1. Start the app.
+2. Add a camera in the left sidebar.
+3. Select the camera and press Connect.
+4. The stream starts automatically after connection.
+5. Use the PTZ pad on the right to move the camera. Buttons move while pressed and stop when released.
+6. Use Snapshot to capture the current frame.
+7. Use Listen to enable camera audio playback for the selected camera.
 
-### Camera configuration file
+## Storage
 
-Camera settings are stored at:
-- **Windows**: `%APPDATA%\ICSeeClient\cameras.json`
-- **macOS / Linux**: `~/.ICSeeClient/cameras.json` (falls back to `~/ICSeeClient/cameras.json`)
+Saved cameras are written to a local JSON file in the application data directory:
 
----
+- Windows: `%APPDATA%\ICSeeClient\cameras.json`
+- macOS: `~/Library/Application Support/ICSeeClient/cameras.json`
+- Linux: `~/.config/ICSeeClient/cameras.json`
 
-## Architecture notes
+## Implementation notes
 
-- The `DVRIPCam` API is **async** (asyncio). A dedicated daemon thread runs a background asyncio event loop for all network I/O.
-- Qt signals (`connection_changed`, `frame_ready`, `error_occurred`) are used to safely marshal results back to the UI thread.
-- Each camera maintains **two** TCP connections — one for commands (PTZ, snapshot) and one dedicated to the blocking `start_monitor()` stream reader — preventing socket conflicts.
-- Video frames (H.264/H.265 NAL units) are decoded by [PyAV](https://pyav.org/) and converted to `QImage` for display.
-
----
-
-# ICSee PTZ control integration for Home Assistant
-
-Home Assistant integration to send ptz commands to ICSee/XMEye/DVR-IP/NetSurveillance/Sofia cameras.
-
-It can also set presets and recall them and synchronize the camera clock.
-
-# Installation
-
-### Option 1: [HACS](https://hacs.xyz/) Link
-
-1. Click [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=David+Buezas+&repository=https%3A%2F%2Fgithub.com%2Fdbuezas%2Ficsee-ptz&category=Integration)
-2. Restart Home Assistant
-
-### Option 2: [HACS](https://hacs.xyz/)
-
-1. Or `HACS` > `Integrations` > `⋮` > `Custom Repositories`
-2. `Repository`: paste the url of this repo
-3. `Category`: Integration
-4. Click `Add`
-5. Close `Custom Repositories` modal
-6. Click `+ EXPLORE & DOWNLOAD REPOSITORIES`
-7. Search for `icsee`
-8. Click `Download`
-9. Restart _Home Assistant_
-
-### Option 2: Manual copy
-
-1. Copy the `icsee_ptz` folder inside `custom_components` of this repo to `/config/custom_components` in your Home Assistant instance
-2. Restart _Home Assistant_
-
-# Configuration
-
-Go to the integration and add an entry for each of your cameras
-
-[![Open your Home Assistant instance and show an integration.](https://my.home-assistant.io/badges/integration.svg)](https://my.home-assistant.io/redirect/integration/?domain=icsee_ptz)
-
-<img width="447" alt="image" src="https://github.com/dbuezas/icsee-ptz/assets/777196/1853de8a-85c1-4578-8932-11a0923d4dd8" width="350">
-
-# Usage
-
-This integration exposes services for PTZ and a motion alarm entity. 
-
-## Motion alarm
-
-First make sure to enable and configure motion alarms in the standard camera application (e.g ICSee or XMEye).
-Then, you can use the provided entity in your automations.
-
-<img width="350" alt="image" src="https://github.com/dbuezas/icsee-ptz/assets/777196/06ef6fd4-e04c-4c06-83e1-724db6d65b05">
-
-## Pan, tilt, zoom (PTZ)
-
-icsee_ptz.move: move, zoom and set/goto preseets.
-
-Requires:
-
-- WebRTC integration v3.2.0 - 2023-07-11
-
-
-Test PTZ control from [![Developer Tools / Services.](https://my.home-assistant.io/badges/developer_services.svg)](https://my.home-assistant.io/redirect/developer_services/).
-
-<img width="350" alt="image" src="https://github.com/dbuezas/icsee-ptz/assets/777196/18941eed-c370-428d-b2fd-31db13a21bc7">
-
-## Example automation
-
-```yaml
-alias: Notify camera motion alarm
-description: ""
-trigger:
-  - platform: state
-    entity_id:
-      - binary_sensor.garden_motion_alarm
-    to: "on"
-condition: []
-action:
-  - service: notify.mobile_app_pixel_7
-    data:
-      message: TTS
-      data:
-        tts_text: Attention: motion detected in garden
-        ttl: 0
-        priority: high
-mode: single
-
-```
-
-# Usage in [WebRTC card](https://github.com/AlexxIT/WebRTC):
-
-<img src="https://github.com/dbuezas/icsee-ptz/assets/777196/36674140-11bf-438c-ba68-159a9d422158"  width="350">
-
-```yaml
-# lovelace card
-type: custom:webrtc-camera
-url: garden_dvrip
-ui: true
-shortcuts:
-  services:
-    - name: Sync
-      icon: mdi:clock-check
-      service: icsee_ptz.synchronize_clock
-      service_data:
-        entity_id: binary_sensor.garten_motion_alarm
-    - name: Force frame
-      icon: mdi:play
-      service: icsee_ptz.force_frame
-      service_data:
-        entity_id: binary_sensor.garten_motion_alarm
-ptz:
-  service: icsee_ptz.move
-  data_home:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: GotoPreset
-    preset: 0
-  data_long_home:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: SetPreset
-    preset: 0
-  data_start_left:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: DirectionLeft
-  data_end_left:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: Stop
-  data_start_right:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: DirectionRight
-  data_end_right:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: Stop
-  data_start_down:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: DirectionDown
-  data_end_down:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: Stop
-  data_start_up:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: DirectionUp
-  data_end_up:
-    entity_id: binary_sensor.garten_motion_alarm
-    cmd: Stop
-
-```
-
-# Video stream from [go2rtc](https://github.com/AlexxIT/go2rtc)
-
-```yaml
-# go2rtc.yaml
-streams:
-  garden_dvrip:
-    - dvrip://admin:my_password@192.168.178.104:34567
-  garden_dvrip_mini:
-    - dvrip://admin:my_password@192.168.178.104:34567?channel=0&subtype=1
-  garden: # try this if the video is choppy or audio is out of synch
-    - ffmpeg:garden_dvrip#audio=copy#async#video=copy#async
-```
-# Entities
-
-> [!NOTE]  
-> There are some disabled entities, But you can enable them on 
->
-> `Settings -> Devices & Services -> ICSee -> Configure -> Enable experimental entities`
-
-| Entity                                    | Description                                                              | Enabled by default |
-| ----------------------------------------- | ------------------------------------------------------------------------ | ------------------ |
-| `switch.*_blinddetect_enabled`            |                                                                          | No                 |
-| `select.*_white_light`                    | You can control camera's lights.                                         | No                 |
-| `switch.*_humandetection_enabled`         |                                                                          | No                 |
-| `switch.*_lossdetect_enabled`             |                                                                          | No                 |
-| `binary_sensor.*_varanda_motion_alarm`    | It will be trigged when someone pass on front of camera.                 | Yes                |
-| `switch.*_motiondetect_enabled`           |                                                                          | No                 |
-
-# Miscelaneous
-
-With https://xmeye.org/xmeye-for-pc/ you can configure the fps and encoding params of ICSee cameras.
-
-## Recommended configuration:
-
-in `device config` / `encode config` select:
-
-- fps: 30 (maximum available)
-- Iframe interval: 1 (minimum available)
-- Static encode config: high profile
-- H264+ enable: disabled
-
-in `device config` / `camera param` select:
-
-- Clear fog: ON
-- Level: 100
+- Camera I/O runs on a dedicated background asyncio event loop so the UI stays responsive.
+- The app uses two camera connections: one for commands and one for the live stream.
+- The live stream keeps the newest frames and drops stale ones to reduce latency.
+- Audio playback is optional and falls back cleanly if Qt Multimedia is not available.
+- The UI uses a modern dark theme with simplified controls and larger spacing.

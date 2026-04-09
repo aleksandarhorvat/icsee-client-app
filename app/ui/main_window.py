@@ -17,10 +17,12 @@ Layout
 """
 
 import logging
+import audioop
+import threading
 from typing import Dict, Optional
 
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QImage, QPixmap, QFont, QIcon, QAction
+from PySide6.QtCore import Qt, QSize, QTimer, QIODevice, QObject
+from PySide6.QtGui import QImage, QPixmap, QFont, QAction, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -43,6 +45,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+try:
+    from PySide6.QtMultimedia import QAudioFormat, QAudioSink
+
+    _AUDIO_AVAILABLE = True
+except ImportError:
+    _AUDIO_AVAILABLE = False
+
 from app.models.camera import CameraConfig
 from app.services.camera_service import CameraService
 from app.utils.config_manager import ConfigManager
@@ -62,6 +71,7 @@ class _VideoWidget(QLabel):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._source_image: Optional[QImage] = None
+        self._portrait_view = False
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(400, 300)
@@ -88,6 +98,11 @@ class _VideoWidget(QLabel):
         if self._source_image is None:
             return
         pixmap = QPixmap.fromImage(self._source_image)
+        if self._portrait_view:
+            pixmap = pixmap.transformed(
+                QTransform().rotate(90),
+                Qt.TransformationMode.SmoothTransformation,
+            )
         scaled = pixmap.scaled(
             self.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
@@ -149,6 +164,99 @@ class _AddCameraDialog(QDialog):
         )
 
 
+class _PCMBufferDevice(QIODevice):
+    """Thread-safe pull buffer consumed by QAudioSink."""
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__()
+        if parent is not None:
+            self.setParent(parent)
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._max_buffer = 32000
+
+    def start(self) -> None:
+        self.open(QIODevice.OpenModeFlag.ReadOnly)
+
+    def stop(self) -> None:
+        self.close()
+        with self._lock:
+            self._buffer.clear()
+
+    def push_pcm(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._lock:
+            self._buffer.extend(data)
+            if len(self._buffer) > self._max_buffer:
+                drop = len(self._buffer) - self._max_buffer
+                del self._buffer[:drop]
+
+    def readData(self, maxlen: int) -> bytes:  # noqa: N802
+        with self._lock:
+            if not self._buffer:
+                return b""
+            chunk = bytes(self._buffer[:maxlen])
+            del self._buffer[:maxlen]
+            return chunk
+
+    def writeData(self, data: bytes) -> int:  # noqa: N802
+        return 0
+
+    def bytesAvailable(self) -> int:  # noqa: N802
+        with self._lock:
+            buffered = len(self._buffer)
+        return buffered + super().bytesAvailable()
+
+
+class _AudioPlayer:
+    """Minimal live audio player for G.711 monitor frames."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        self._enabled = False
+        self._device: Optional[_PCMBufferDevice] = None
+        self._sink = None
+
+        if not _AUDIO_AVAILABLE:
+            return
+
+        fmt = QAudioFormat()
+        fmt.setSampleRate(8000)
+        fmt.setChannelCount(1)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+
+        self._device = _PCMBufferDevice(parent)
+        self._sink = QAudioSink(fmt, parent)
+
+    def start(self) -> None:
+        if self._device is None or self._sink is None:
+            return
+        self._enabled = True
+        self._device.start()
+        self._sink.start(self._device)
+
+    def stop(self) -> None:
+        self._enabled = False
+        if self._sink is not None:
+            self._sink.stop()
+        if self._device is not None:
+            self._device.stop()
+
+    def feed(self, payload: bytes, codec: str) -> None:
+        if not self._enabled or self._device is None:
+            return
+        try:
+            if codec == "g711a":
+                pcm = audioop.alaw2lin(payload, 2)
+            elif codec == "g711u":
+                pcm = audioop.ulaw2lin(payload, 2)
+            else:
+                return
+            self._device.push_pcm(pcm)
+        except Exception:
+            return
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -172,10 +280,52 @@ class MainWindow(QMainWindow):
         self._active_camera_id: Optional[str] = None
         # Whether the active camera is currently streaming
         self._streaming: bool = False
+        self._audio_camera_id: Optional[str] = None
+        self._audio_player = _AudioPlayer(self)
 
+        self._apply_modern_theme()
         self._build_ui()
         self._connect_signals()
         self._load_saved_cameras()
+        QTimer.singleShot(0, self._auto_connect_first_camera)
+
+    def _apply_modern_theme(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow { background: #0c1220; }
+            QToolBar {
+                background: #111a2d;
+                border: none;
+                spacing: 8px;
+                padding: 8px;
+            }
+            QToolButton {
+                color: #dce8ff;
+                background: #16213a;
+                border: 1px solid #24324f;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: 600;
+            }
+            QToolButton:hover { background: #1e2d4a; }
+            QToolButton:pressed { background: #0f1a30; }
+            QToolButton:checked {
+                background: #2a5d3b;
+                border-color: #4c8f60;
+                color: #eaffef;
+            }
+            QToolButton:disabled {
+                color: #6f7c98;
+                background: #111a2b;
+                border-color: #1b2740;
+            }
+            QStatusBar {
+                background: #0f182a;
+                color: #9eb1d6;
+                border-top: 1px solid #1f2d49;
+            }
+            """
+        )
 
     # ------------------------------------------------------------------
     # UI construction
@@ -186,14 +336,22 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Controls", self)
         toolbar.setIconSize(QSize(20, 20))
         toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
 
         self._act_connect = QAction("▶  Connect", self)
         self._act_disconnect = QAction("■  Disconnect", self)
         self._act_refresh = QAction("↺  Refresh", self)
         self._act_snapshot = QAction("📷  Snapshot", self)
+        self._act_audio = QAction("🔊  Listen", self)
+        self._act_audio.setCheckable(True)
 
-        for act in (self._act_connect, self._act_disconnect, self._act_refresh, self._act_snapshot):
+        for act in (
+            self._act_connect,
+            self._act_disconnect,
+            self._act_snapshot,
+            self._act_audio,
+        ):
             toolbar.addAction(act)
 
         self._act_disconnect.setEnabled(False)
@@ -204,31 +362,38 @@ class MainWindow(QMainWindow):
 
         # Left sidebar
         sidebar = QWidget()
-        sidebar.setFixedWidth(220)
-        sidebar.setStyleSheet("background-color: #0f3460;")
+        sidebar.setFixedWidth(250)
+        sidebar.setStyleSheet(
+            """
+            QWidget { background: #101a2e; border-right: 1px solid #1f2d49; }
+            """
+        )
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(8, 8, 8, 8)
-        sidebar_layout.setSpacing(6)
+        sidebar_layout.setContentsMargins(12, 12, 12, 12)
+        sidebar_layout.setSpacing(10)
 
         title_label = QLabel("Cameras")
-        title_label.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
+        title_label.setStyleSheet("color: #dce8ff; font-weight: 700; font-size: 14px;")
         sidebar_layout.addWidget(title_label)
 
         self._camera_list = QListWidget()
         self._camera_list.setStyleSheet(
             """
             QListWidget {
-                background-color: #16213e;
-                color: #e0e0e0;
-                border: none;
-                border-radius: 4px;
+                background-color: #0f1728;
+                color: #dce8ff;
+                border: 1px solid #1f2d49;
+                border-radius: 10px;
+                padding: 4px;
             }
             QListWidget::item:selected {
-                background-color: #0f3460;
+                background-color: #1f355d;
                 color: white;
+                border-radius: 6px;
             }
             QListWidget::item:hover {
-                background-color: #1a4a7a;
+                background-color: #182844;
+                border-radius: 6px;
             }
             """
         )
@@ -239,9 +404,9 @@ class MainWindow(QMainWindow):
         self._btn_remove = QPushButton("− Remove")
         for btn in (self._btn_add, self._btn_remove):
             btn.setStyleSheet(
-                "QPushButton { background:#e94560; color:white; border-radius:4px; padding:4px 8px; }"
-                "QPushButton:hover { background:#c73450; }"
-                "QPushButton:disabled { background:#444; }"
+                "QPushButton { background:#21365b; color:#e7efff; border:1px solid #314a76; border-radius:8px; padding:6px 10px; font-weight:600; }"
+                "QPushButton:hover { background:#29436f; }"
+                "QPushButton:disabled { background:#131e34; color:#6d7c9e; border-color:#1c2b47; }"
             )
         btn_layout.addWidget(self._btn_add)
         btn_layout.addWidget(self._btn_remove)
@@ -251,18 +416,26 @@ class MainWindow(QMainWindow):
 
         # Right panel: video + PTZ
         right_panel = QWidget()
+        right_panel.setStyleSheet("QWidget { background: #0c1220; }")
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.setSpacing(10)
 
         self._video_widget = _VideoWidget()
-        right_layout.addWidget(self._video_widget)
+        right_row = QHBoxLayout()
+        right_row.setSpacing(14)
+        right_row.addWidget(self._video_widget, 1)
 
-        # PTZ controls
+        # PTZ controls on the right side for easier one-handed usage.
         ptz_bar = self._build_ptz_bar()
-        right_layout.addWidget(ptz_bar)
+        right_row.addWidget(ptz_bar, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        right_layout.addLayout(right_row, 1)
 
         splitter.addWidget(right_panel)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(1)
+        splitter.setSizes([220, max(1, self.width() - 220)])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
@@ -278,69 +451,54 @@ class MainWindow(QMainWindow):
         status_bar.addWidget(self._status_message)
 
     def _build_ptz_bar(self) -> QWidget:
-        """Return a widget containing directional PTZ buttons."""
+        """Return a compact right-side directional PTZ panel."""
         container = QWidget()
-        container.setFixedHeight(120)
-        container.setStyleSheet("background-color: #0d0d0d;")
+        container.setFixedWidth(120)
+        container.setStyleSheet(
+            "QWidget { background-color: #101a2e; border: 1px solid #1f2d49; border-radius: 12px; }"
+        )
 
-        outer = QHBoxLayout(container)
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(10, 12, 10, 12)
+        outer.setSpacing(10)
         outer.addStretch()
 
-        grid_widget = QWidget()
-        grid = QHBoxLayout(grid_widget)
-        grid.setSpacing(4)
+        outer.addWidget(self._ptz_btn("▲", "DirectionUp"), alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Left column: Left + zoom-wide
-        col_left = QVBoxLayout()
-        col_left.addStretch()
-        col_left.addWidget(self._ptz_btn("◀", "DirectionLeft"))
-        col_left.addWidget(self._ptz_btn("−Z", "ZoomWide"))
-        col_left.addStretch()
-
-        # Centre column: Up, Stop, Down
-        col_centre = QVBoxLayout()
-        col_centre.setSpacing(4)
-        col_centre.addWidget(self._ptz_btn("▲", "DirectionUp"))
         stop_btn = QPushButton("■")
-        stop_btn.setFixedSize(40, 40)
+        stop_btn.setFixedSize(48, 48)
         stop_btn.setStyleSheet(
-            "QPushButton { background:#e94560; color:white; border-radius:4px; font-size:14px; }"
-            "QPushButton:hover { background:#c73450; }"
+            "QPushButton { background:#e45757; color:white; border:1px solid #f07a7a; border-radius:10px; font-size:16px; font-weight:700; }"
+            "QPushButton:hover { background:#cf4949; }"
         )
         stop_btn.clicked.connect(lambda: self._send_ptz("Stop"))
-        col_centre.addWidget(stop_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-        col_centre.addWidget(self._ptz_btn("▼", "DirectionDown"))
+        outer.addWidget(stop_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Right column: Right + zoom-tilt
-        col_right = QVBoxLayout()
-        col_right.addStretch()
-        col_right.addWidget(self._ptz_btn("▶", "DirectionRight"))
-        col_right.addWidget(self._ptz_btn("+Z", "ZoomTile"))
-        col_right.addStretch()
+        outer.addWidget(self._ptz_btn("▼", "DirectionDown"), alignment=Qt.AlignmentFlag.AlignCenter)
 
-        grid.addLayout(col_left)
-        grid.addLayout(col_centre)
-        grid.addLayout(col_right)
+        row_lr = QHBoxLayout()
+        row_lr.setSpacing(8)
+        row_lr.addWidget(self._ptz_btn("◀", "DirectionRight"))
+        row_lr.addWidget(self._ptz_btn("▶", "DirectionLeft"))
+        outer.addLayout(row_lr)
 
-        outer.addWidget(grid_widget)
         outer.addStretch()
         return container
 
     @staticmethod
     def _ptz_btn_style() -> str:
         return (
-            "QPushButton { background:#1a4a7a; color:white; border-radius:4px;"
-            " font-size:14px; min-width:40px; min-height:40px; }"
-            "QPushButton:hover { background:#0f3460; }"
-            "QPushButton:pressed { background:#0a2040; }"
-            "QPushButton:disabled { background:#333; color:#666; }"
+            "QPushButton { background:#1f355d; color:#f0f5ff; border:1px solid #2c4c84; border-radius:10px;"
+            " font-size:18px; font-weight:700; min-width:48px; min-height:48px; }"
+            "QPushButton:hover { background:#274373; }"
+            "QPushButton:pressed { background:#193055; }"
+            "QPushButton:disabled { background:#131e34; color:#5f7094; border-color:#1b2b48; }"
         )
 
     def _ptz_btn(self, label: str, cmd: str) -> QPushButton:
         btn = QPushButton(label)
-        btn.setFixedSize(40, 40)
+        btn.setFixedSize(48, 48)
         btn.setStyleSheet(self._ptz_btn_style())
-        # Send command on press; send Stop on release.
         btn.pressed.connect(lambda c=cmd: self._send_ptz(c))
         btn.released.connect(lambda: self._send_ptz("Stop"))
         return btn
@@ -367,6 +525,8 @@ class MainWindow(QMainWindow):
         self._service.frame_ready.connect(self._on_frame_ready)
         self._service.snapshot_ready.connect(self._on_snapshot_ready)
         self._service.error_occurred.connect(self._on_error)
+        self._service.audio_frame_ready.connect(self._on_audio_frame_ready)
+        self._act_audio.toggled.connect(self._on_audio_toggled)
 
     # ------------------------------------------------------------------
     # Camera management
@@ -375,6 +535,15 @@ class MainWindow(QMainWindow):
     def _load_saved_cameras(self) -> None:
         for cam in self._config_manager.load_cameras():
             self._add_camera_to_ui(cam)
+
+    def _auto_connect_first_camera(self) -> None:
+        if self._active_camera_id is not None:
+            return
+        if self._camera_list.count() == 0:
+            return
+        self._camera_list.setCurrentRow(0)
+        if self._active_camera_id is not None:
+            self._on_connect()
 
     def _add_camera_to_ui(self, cam: CameraConfig) -> None:
         self._cameras[cam.id] = cam
@@ -447,10 +616,17 @@ class MainWindow(QMainWindow):
             self._active_camera_id = None
             self._update_toolbar_state(connected=False)
             return
-        self._active_camera_id = current.data(Qt.ItemDataRole.UserRole)
-        cam = self._cameras.get(self._active_camera_id)
+        camera_id = current.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(camera_id, str):
+            self._active_camera_id = None
+            self._update_toolbar_state(connected=False)
+            return
+        self._active_camera_id = camera_id
+        cam = self._cameras.get(camera_id)
         if cam:
             self._set_status(f"Selected: {cam.name} ({cam.host})", "#aaa")
+        if self._act_audio.isChecked():
+            self._switch_audio_camera(camera_id)
 
     def _on_connect(self) -> None:
         if self._active_camera_id is None:
@@ -465,6 +641,8 @@ class MainWindow(QMainWindow):
         self._service.disconnect_camera(self._active_camera_id)
         self._streaming = False
         self._video_widget.clear_frame()
+        if self._act_audio.isChecked():
+            self._act_audio.setChecked(False)
 
     def _on_refresh(self) -> None:
         if self._active_camera_id is None:
@@ -480,8 +658,49 @@ class MainWindow(QMainWindow):
         self._service.take_snapshot(self._active_camera_id)
 
     def _send_ptz(self, cmd: str) -> None:
-        if self._active_camera_id and self._streaming:
-            self._service.ptz_command(self._active_camera_id, cmd)
+        camera_id = self._active_camera_id
+        if camera_id is not None:
+            cam = self._cameras.get(camera_id)
+            name = cam.name if cam else camera_id
+            self._set_status(f"PTZ: {cmd} -> {name}", "#f0c040")
+            move_step_map = {
+                "DirectionLeft": 2,
+                "DirectionRight": 2,
+                "DirectionDown": 2,
+                "DirectionUp": 2,
+            }
+            step = move_step_map.get(cmd, 2)
+            self._service.ptz_command(camera_id, cmd, step=step)
+
+    def _switch_audio_camera(self, camera_id: str) -> None:
+        if self._audio_camera_id and self._audio_camera_id != camera_id:
+            self._service.set_audio_enabled(self._audio_camera_id, False)
+        self._audio_camera_id = camera_id
+        self._service.set_audio_enabled(camera_id, True)
+
+    def _on_audio_toggled(self, enabled: bool) -> None:
+        if enabled:
+            if not _AUDIO_AVAILABLE:
+                self._set_status("Audio output unavailable in this build.", "#e94560")
+                self._act_audio.setChecked(False)
+                return
+            camera_id = self._active_camera_id
+            if camera_id is None:
+                self._set_status("Select and connect a camera first.", "#e94560")
+                self._act_audio.setChecked(False)
+                return
+            self._switch_audio_camera(camera_id)
+            self._audio_player.start()
+            self._act_audio.setText("🔊  Listening")
+            self._set_status("Audio monitor enabled", "#40c040")
+            return
+
+        if self._audio_camera_id:
+            self._service.set_audio_enabled(self._audio_camera_id, False)
+            self._audio_camera_id = None
+        self._audio_player.stop()
+        self._act_audio.setText("🔊  Listen")
+        self._set_status("Audio monitor disabled", "#aaa")
 
     # ------------------------------------------------------------------
     # Service signal handlers (called on Qt main thread)
@@ -505,6 +724,8 @@ class MainWindow(QMainWindow):
                 self._set_indicator(False)
                 self._update_toolbar_state(connected=False)
                 self._streaming = False
+            if camera_id == self._audio_camera_id and self._act_audio.isChecked():
+                self._act_audio.setChecked(False)
 
         # Update list item colour.
         item = self._list_items.get(camera_id)
@@ -517,11 +738,18 @@ class MainWindow(QMainWindow):
         if camera_id == self._active_camera_id:
             self._video_widget.update_frame(qimage)
 
+    def _on_audio_frame_ready(self, camera_id: str, payload: bytes, codec: str) -> None:
+        if not self._act_audio.isChecked():
+            return
+        if camera_id != self._audio_camera_id:
+            return
+        self._audio_player.feed(payload, codec)
+
     def _on_snapshot_ready(self, camera_id: str, jpeg_bytes: bytes) -> None:
         if camera_id != self._active_camera_id:
             return
         img = QImage()
-        if img.loadFromData(jpeg_bytes, "JPEG"):
+        if img.loadFromData(jpeg_bytes, b"JPEG"):
             self._video_widget.update_frame(img)
         else:
             # Try treating the snapshot as a raw H264 frame.
@@ -540,8 +768,8 @@ class MainWindow(QMainWindow):
     def _update_toolbar_state(self, *, connected: bool) -> None:
         self._act_connect.setEnabled(not connected)
         self._act_disconnect.setEnabled(connected)
-        self._act_refresh.setEnabled(True)
         self._act_snapshot.setEnabled(connected)
+        self._act_audio.setEnabled(connected)
 
     def _set_status(self, message: str, colour: str = "#aaa") -> None:
         self._status_message.setText(message)
@@ -561,5 +789,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """Gracefully shut down camera connections before exiting."""
+        self._audio_player.stop()
         self._service.shutdown()
         super().closeEvent(event)

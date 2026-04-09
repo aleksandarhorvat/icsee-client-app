@@ -24,8 +24,11 @@ a = Analysis(
     pathex=[str(PROJECT_ROOT)],
     binaries=[],
     datas=[
-        # Bundle the entire existing API module directory.
-        (str(PROJECT_ROOT / "custom_components"), "custom_components"),
+        # Bundle only the DVRIP protocol module used by the desktop app.
+        (
+            str(PROJECT_ROOT / "custom_components" / "icsee_ptz" / "asyncio_dvrip.py"),
+            "custom_components/icsee_ptz",
+        ),
     ],
     hiddenimports=[
         # PySide6 modules that PyInstaller may miss via static analysis.

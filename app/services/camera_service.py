@@ -17,8 +17,10 @@ integration (camera.py in the existing codebase) and prevents socket conflicts.
 
 import asyncio
 import logging
+import re
 import threading
-from typing import Dict, Optional
+import time
+from typing import Any, Coroutine, Dict, Optional
 
 from PySide6.QtCore import QObject, Signal
 
@@ -61,7 +63,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 try:
     import av
-    import numpy as np
     from PySide6.QtGui import QImage
 
     _AV_AVAILABLE = True
@@ -71,50 +72,63 @@ except ImportError:
 
 
 class _FrameDecoder:
-    """Decodes raw H264/H265 NAL data into QImage objects using PyAV."""
+    """Decodes raw H.264/H.265 NAL data into QImage objects using PyAV."""
 
-    def __init__(self, codec_name: str = "h264") -> None:
-        self._codec_name = codec_name
-        self._codec: Optional["av.CodecContext"] = None
-        self._init_codec()
+    def __init__(self, codec_names: tuple[str, ...] = ("hevc", "h264")) -> None:
+        self._codec_names = codec_names
+        self._codecs: Dict[str, Any] = {
+            codec_name: None for codec_name in codec_names
+        }
+        for codec_name in codec_names:
+            self._init_codec(codec_name)
 
-    def _init_codec(self) -> None:
+    def _init_codec(self, codec_name: str) -> None:
         if not _AV_AVAILABLE:
             return
         try:
-            self._codec = av.CodecContext.create(self._codec_name, "r")
+            self._codecs[codec_name] = av.CodecContext.create(codec_name, "r")
         except Exception as exc:
-            logger.error("Failed to create %s decoder: %s", self._codec_name, exc)
-            self._codec = None
+            logger.error("Failed to create %s decoder: %s", codec_name, exc)
+            self._codecs[codec_name] = None
 
     def decode(self, raw_bytes: bytes) -> Optional["QImage"]:
         """Return a QImage for the given raw NAL data, or None on failure."""
-        if not _AV_AVAILABLE or self._codec is None:
+        if not _AV_AVAILABLE:
             return None
-        try:
-            # ICSee cameras send raw NAL units — prepend Annex-B start code
-            # only when the start code is absent.
-            if not raw_bytes[:4] == b"\x00\x00\x00\x01":
-                data = b"\x00\x00\x00\x01" + raw_bytes
-            else:
-                data = raw_bytes
 
-            packets = self._codec.parse(data)
-            for pkt in packets:
-                frames = self._codec.decode(pkt)
-                for frm in frames:
-                    arr = frm.to_ndarray(format="rgb24")
-                    h, w, ch = arr.shape
-                    return QImage(
-                        arr.tobytes(),
-                        w,
-                        h,
-                        w * ch,
-                        QImage.Format.Format_RGB888,
-                    )
+        if not raw_bytes:
+            return None
+
+        if raw_bytes[:4] == b"\x00\x00\x00\x01":
+            data = raw_bytes
+        else:
+            data = b"\x00\x00\x00\x01" + raw_bytes
+
+        try:
+            for codec_name in self._codec_names:
+                codec = self._codecs.get(codec_name)
+                if codec is None:
+                    continue
+                try:
+                    codec_any: Any = codec
+                    packets = codec_any.parse(data)
+                    for pkt in packets:
+                        frames = codec_any.decode(pkt)
+                        for frm in frames:
+                            arr = frm.to_ndarray(format="rgb24")
+                            h, w, ch = arr.shape
+                            return QImage(
+                                arr.tobytes(),
+                                w,
+                                h,
+                                w * ch,
+                                QImage.Format.Format_RGB888,
+                            )
+                except Exception as exc:
+                    logger.debug("Decode error (%s), resetting codec: %s", codec_name, exc)
+                    self._init_codec(codec_name)
         except Exception as exc:
-            logger.debug("Decode error (%s), resetting codec: %s", self._codec_name, exc)
-            self._init_codec()
+            logger.debug("Unexpected decode failure: %s", exc)
         return None
 
 
@@ -156,6 +170,10 @@ class CameraService(QObject):
     # Args: camera_id (str), jpeg_bytes (bytes)
     snapshot_ready = Signal(str, bytes)
 
+    # Emitted when an audio frame is available.
+    # Args: camera_id (str), payload (bytes), codec (str)
+    audio_frame_ready = Signal(str, bytes, str)
+
     # Emitted when a non-fatal error occurs (e.g. connect failure).
     # Args: camera_id (str), message (str)
     error_occurred = Signal(str, str)
@@ -163,6 +181,10 @@ class CameraService(QObject):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._states: Dict[str, _CameraState] = {}
+        self._audio_enabled_cameras: set[str] = set()
+        self._last_ptz_cmd: Dict[str, str] = {}
+        self._last_ptz_ts: Dict[str, float] = {}
+        self._prefer_low_latency: bool = True
 
         # Background asyncio loop — runs for the entire application lifetime.
         self._loop = asyncio.new_event_loop()
@@ -178,7 +200,7 @@ class CameraService(QObject):
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def _submit(self, coro) -> "asyncio.Future":
+    def _submit(self, coro: Coroutine[Any, Any, Any]):
         """Schedule a coroutine on the background loop from any thread."""
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
@@ -205,10 +227,27 @@ class CameraService(QObject):
         """Stop the live video stream (keeps the command connection open)."""
         self._submit(self._stop_stream(camera_id))
 
-    def ptz_command(self, camera_id: str, cmd: str, step: int = 5) -> None:
+    def ptz_command(self, camera_id: str, cmd: str, step: int = 2) -> None:
         """Send a PTZ command (e.g. 'DirectionUp', 'Stop')."""
-        if camera_id not in self._states:
+        state = self._states.get(camera_id)
+        if state is None:
             return
+
+        # Guard against command flooding from rapid presses/releases.
+        now = time.monotonic()
+        last_ts = self._last_ptz_ts.get(camera_id, 0.0)
+        last_cmd = self._last_ptz_cmd.get(camera_id, "")
+        min_interval = 0.05 if cmd == "Stop" else 0.12
+        if cmd == last_cmd and (now - last_ts) < min_interval:
+            return
+
+        # If we are disconnected, drop command early and surface one clear error.
+        if not state.connected or state.command_conn is None:
+            self.error_occurred.emit(camera_id, "PTZ ignored: camera is not connected")
+            return
+
+        self._last_ptz_cmd[camera_id] = cmd
+        self._last_ptz_ts[camera_id] = now
         self._submit(self._ptz(camera_id, cmd, step))
 
     def take_snapshot(self, camera_id: str) -> None:
@@ -225,6 +264,17 @@ class CameraService(QObject):
         """Gracefully close all connections and stop the event loop."""
         self._submit(self._shutdown_all())
 
+    def set_audio_enabled(self, camera_id: str, enabled: bool) -> None:
+        """Enable or disable forwarding audio frames for a camera."""
+        if enabled:
+            self._audio_enabled_cameras.add(camera_id)
+        else:
+            self._audio_enabled_cameras.discard(camera_id)
+
+    def set_prefer_low_latency(self, enabled: bool) -> None:
+        """Select stream priority: low latency (Extra1 first) or high quality (Main first)."""
+        self._prefer_low_latency = enabled
+
     # ------------------------------------------------------------------
     # Async internals
     # ------------------------------------------------------------------
@@ -238,7 +288,18 @@ class CameraService(QObject):
             port=config.port,
         )
         loop = asyncio.get_running_loop()
-        await cam.login(loop)
+        logged_in = await cam.login(loop)
+        if not logged_in:
+            cam.close()
+            # VMS exports often store encoded credentials (e.g. 16-char hex)
+            # that are not valid as the plain DVRIP password.
+            if re.fullmatch(r"[0-9A-F]{16}", config.password or ""):
+                raise SomethingIsWrongWithCamera(
+                    "Login failed: password looks encoded; use the real plain camera password"
+                )
+            raise SomethingIsWrongWithCamera(
+                "Login failed (check username/password and port)"
+            )
         return cam
 
     async def _connect(self, camera_id: str) -> None:
@@ -270,6 +331,9 @@ class CameraService(QObject):
         state = self._states.get(camera_id)
         if state is None:
             return
+        self._audio_enabled_cameras.discard(camera_id)
+        self._last_ptz_cmd.pop(camera_id, None)
+        self._last_ptz_ts.pop(camera_id, None)
         await self._stop_stream(camera_id)
         if state.command_conn:
             state.command_conn.close()
@@ -300,9 +364,7 @@ class CameraService(QObject):
                 state.stream_conn.close()
             state.stream_conn = stream_conn
 
-            # Determine codec from camera info when available.
-            codec_name = "h264"
-            state.decoder = _FrameDecoder(codec_name) if _AV_AVAILABLE else None
+            state.decoder = _FrameDecoder() if _AV_AVAILABLE else None
 
             task = self._loop.create_task(
                 self._stream_worker(camera_id, stream_conn, state.decoder)
@@ -321,7 +383,40 @@ class CameraService(QObject):
     ) -> None:
         """Background task that feeds frames to the UI via Qt signals."""
 
+        latest_video: Optional[bytes] = None
+        frames_seen = 0
+        last_emit_ts = 0.0
+        max_fps = 30.0
+        min_emit_interval = 1.0 / max_fps
+
+        async def _decode_loop() -> None:
+            nonlocal latest_video, last_emit_ts
+            while True:
+                if latest_video is None:
+                    await asyncio.sleep(0.003)
+                    continue
+
+                # Keep latency low by decoding only the newest available frame.
+                frame = latest_video
+                latest_video = None
+
+                now = time.monotonic()
+                wait_for = min_emit_interval - (now - last_emit_ts)
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+
+                if decoder is None:
+                    continue
+
+                qimage = await asyncio.to_thread(decoder.decode, frame)
+                if qimage is not None:
+                    self.frame_ready.emit(camera_id, qimage)
+                    last_emit_ts = time.monotonic()
+
+        decode_task = self._loop.create_task(_decode_loop())
+
         def _frame_callback(frame_data: bytes, meta: dict, _user) -> None:
+            nonlocal latest_video, frames_seen
             if frame_data is None:
                 return
             frame_type = meta.get("type", "")
@@ -329,18 +424,40 @@ class CameraService(QObject):
                 # JPEG — forward raw bytes; the UI will decode them.
                 self.snapshot_ready.emit(camera_id, bytes(frame_data))
                 return
-            if frame_type in ("h264", "h265") and decoder is not None:
-                qimage = decoder.decode(bytes(frame_data))
-                if qimage is not None:
-                    self.frame_ready.emit(camera_id, qimage)
+
+            is_video_frame = frame_type in ("h264", "h265") or (
+                frame_type in (None, "") and meta.get("frame") in ("I", "P")
+            )
+            if is_video_frame:
+                frames_seen += 1
+                latest_video = bytes(frame_data)
+                return
+
+            if (
+                frame_type in ("g711a", "g711u")
+                and camera_id in self._audio_enabled_cameras
+            ):
+                self.audio_frame_ready.emit(camera_id, bytes(frame_data), frame_type)
             # Audio frames and unknown types are silently discarded.
 
         try:
-            await conn.start_monitor(
-                _frame_callback,
-                user={"camera_id": camera_id},
-                stream="Main",
-            )
+            # Stream choice can be switched by UI toggle.
+            stream_order = ("Extra1", "Main") if self._prefer_low_latency else ("Main", "Extra1")
+            for stream_name in stream_order:
+                frames_seen = 0
+                await conn.start_monitor(
+                    _frame_callback,
+                    user={"camera_id": camera_id},
+                    stream=stream_name,
+                )
+                if frames_seen > 0 or stream_name == stream_order[-1]:
+                    break
+                logger.info(
+                    "No frames on %s for camera %s; falling back to %s stream.",
+                    stream_name,
+                    camera_id,
+                    stream_order[-1],
+                )
         except asyncio.CancelledError:
             logger.debug("Stream task cancelled for camera %s.", camera_id)
         except Exception as exc:
@@ -348,6 +465,11 @@ class CameraService(QObject):
             self.error_occurred.emit(camera_id, f"Stream lost: {exc}")
             self.connection_changed.emit(camera_id, False)
         finally:
+            decode_task.cancel()
+            try:
+                await decode_task
+            except (asyncio.CancelledError, Exception):
+                pass
             conn.close()
 
     async def _stop_stream(self, camera_id: str) -> None:
@@ -372,16 +494,50 @@ class CameraService(QObject):
     async def _ptz(self, camera_id: str, cmd: str, step: int = 5) -> None:
         state = self._states.get(camera_id)
         if state is None or state.command_conn is None:
+            self.error_occurred.emit(camera_id, "PTZ failed: not connected")
             return
         try:
-            await state.command_conn.ptz(
-                cmd,
-                step=step,
-                ch=state.config.channel,
+            # Match the Home Assistant integration behavior for broader camera compatibility.
+            if cmd == "Stop":
+                reply = await state.command_conn.ptz("DirectionUp", preset=-1)
+                if not reply or reply.get("Ret") not in state.command_conn.OK_CODES:
+                    raise SomethingIsWrongWithCamera("camera rejected PTZ command 'Stop'")
+                return
+
+            cmd_variants = [cmd]
+            if cmd == "ZoomTile":
+                cmd_variants = ["ZoomTile", "ZoomTele", "FocusFar", "IrisLarge"]
+            elif cmd == "ZoomTele":
+                cmd_variants = ["ZoomTele", "ZoomTile", "FocusFar", "IrisLarge"]
+            elif cmd == "ZoomWide":
+                cmd_variants = ["ZoomWide", "ZoomNear", "FocusNear", "IrisSmall"]
+
+            for cmd_variant in cmd_variants:
+                zoom_step = max(step, 6) if cmd_variant.startswith("Zoom") else step
+                reply = await state.command_conn.ptz(
+                    cmd_variant,
+                    step=zoom_step,
+                    preset=0,
+                    ch=state.config.channel,
+                )
+                if reply and reply.get("Ret") in state.command_conn.OK_CODES:
+                    return
+
+            raise SomethingIsWrongWithCamera(
+                f"camera rejected PTZ command '{cmd}' (tried: {', '.join(cmd_variants)})"
             )
         except Exception as exc:
             logger.warning("PTZ command '%s' failed for camera %s: %s", cmd, camera_id, exc)
-            self.error_occurred.emit(camera_id, f"PTZ failed: {exc}")
+            self.error_occurred.emit(
+                camera_id,
+                f"PTZ failed: {exc} (if this happens after many rapid presses, try reconnect)",
+            )
+
+    async def _ptz_pulse(self, camera_id: str, cmd: str, step: int = 10) -> None:
+        await self._ptz(camera_id, cmd, step)
+        if cmd != "Stop":
+            await asyncio.sleep(0.35)
+            await self._ptz(camera_id, "Stop", step)
 
     async def _snapshot(self, camera_id: str) -> None:
         state = self._states.get(camera_id)
